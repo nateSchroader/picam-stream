@@ -58,6 +58,9 @@ ALLOWED = [
 DEFAULT_SIZE = (640, 480)
 DEFAULT_FPS = 20
 MIN_FPS, MAX_FPS = 5, 30
+# MJPEG encoder quality (higher = fewer compression artifacts, more CPU + bandwidth).
+DEFAULT_JPEG_Q = 85
+MIN_JPEG_Q, MAX_JPEG_Q = 25, 95
 
 # Runtime state dir: systemd sets STATE_DIRECTORY (e.g. /var/lib/picam-stream); fall back to
 # the script's own directory for manual runs. Keeps a strict-FS sandbox from blocking writes.
@@ -188,7 +191,7 @@ class CameraManager:
         self.output = StreamingOutput()
         self.picam2 = Picamera2()
         (self.width, self.height, self.framerate,
-         self.hflip, self.vflip, self.controls) = self._load()
+         self.hflip, self.vflip, self.controls, self.jpeg_q) = self._load()
         self._start()
         self._save()  # make sure the state file exists
 
@@ -197,6 +200,7 @@ class CameraManager:
         fps = DEFAULT_FPS
         hflip = vflip = False
         ctrls = {}
+        jpeg_q = DEFAULT_JPEG_Q
         try:
             with open(CONFIG_PATH) as f:
                 d = json.load(f)
@@ -208,9 +212,12 @@ class CameraManager:
             hflip = _as_bool(d.get("hflip", False))
             vflip = _as_bool(d.get("vflip", False))
             ctrls = validate_controls(d.get("controls", {}))
+            saved_q = int(d.get("jpeg_q", jpeg_q))
+            if MIN_JPEG_Q <= saved_q <= MAX_JPEG_Q:
+                jpeg_q = saved_q
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             pass
-        return w, h, fps, hflip, vflip, ctrls
+        return w, h, fps, hflip, vflip, ctrls, jpeg_q
 
     def _save(self):
         try:
@@ -218,7 +225,8 @@ class CameraManager:
             with open(tmp, "w") as f:
                 json.dump({"width": self.width, "height": self.height,
                            "framerate": self.framerate, "hflip": self.hflip,
-                           "vflip": self.vflip, "controls": self.controls}, f)
+                           "vflip": self.vflip, "controls": self.controls,
+                           "jpeg_q": self.jpeg_q}, f)
             os.replace(tmp, CONFIG_PATH)
         except OSError as e:
             logging.warning("could not save %s: %s", CONFIG_PATH, e)
@@ -230,14 +238,15 @@ class CameraManager:
             transform=Transform(hflip=self.hflip, vflip=self.vflip),
         )
         self.picam2.configure(cfg)
-        self.picam2.start_recording(JpegEncoder(), FileOutput(self.output))
+        self.picam2.start_recording(JpegEncoder(q=self.jpeg_q), FileOutput(self.output))
         if self.controls:
             try:
                 self.picam2.set_controls(self.controls)
             except Exception as e:  # noqa: BLE001 - bad persisted controls shouldn't crash
                 logging.warning("could not apply saved controls %s: %s", self.controls, e)
-        logging.info("Streaming at %dx%d @ %dfps (hflip=%s vflip=%s)",
-                     self.width, self.height, self.framerate, self.hflip, self.vflip)
+        logging.info("Streaming at %dx%d @ %dfps q%d (hflip=%s vflip=%s)",
+                     self.width, self.height, self.framerate, self.jpeg_q,
+                     self.hflip, self.vflip)
 
     def set_resolution(self, width, height, framerate=None):
         if (width, height) not in ALLOWED:
@@ -255,9 +264,10 @@ class CameraManager:
             self._start()
             self._save()
 
-    def update_controls(self, hflip=None, vflip=None, controls=None):
-        """Apply transform (flip) and/or live controls. Flip changes require a
-        stop->reconfigure->start; live controls apply without a restart."""
+    def update_controls(self, hflip=None, vflip=None, controls=None, jpeg_q=None):
+        """Apply transform (flip), JPEG quality, and/or live controls. Flip and
+        quality changes need a stop->reconfigure->start (the encoder is rebuilt);
+        live controls apply without a restart."""
         with self.lock:
             need_reconfig = False
             if hflip is not None and bool(hflip) != self.hflip:
@@ -266,10 +276,16 @@ class CameraManager:
             if vflip is not None and bool(vflip) != self.vflip:
                 self.vflip = bool(vflip)
                 need_reconfig = True
+            if jpeg_q is not None:
+                q = max(MIN_JPEG_Q, min(MAX_JPEG_Q, int(jpeg_q)))
+                if q != self.jpeg_q:
+                    self.jpeg_q = q
+                    need_reconfig = True
             if controls:
                 self.controls.update(controls)
             if need_reconfig:
-                logging.info("Reconfiguring -> hflip=%s vflip=%s", self.hflip, self.vflip)
+                logging.info("Reconfiguring -> hflip=%s vflip=%s q%d",
+                             self.hflip, self.vflip, self.jpeg_q)
                 self.picam2.stop_recording()
                 self._start()  # reapplies self.controls too
             elif controls:
@@ -288,8 +304,9 @@ class CameraManager:
         defaults["AwbEnable"] = True
         defaults["AwbMode"] = AWB_MODES["auto"]
         with self.lock:
-            need_reconfig = self.hflip or self.vflip
+            need_reconfig = self.hflip or self.vflip or self.jpeg_q != DEFAULT_JPEG_Q
             self.hflip = self.vflip = False
+            self.jpeg_q = DEFAULT_JPEG_Q
             self.controls = {}  # persist no overrides -> native defaults on restart
             if need_reconfig:
                 logging.info("Resetting controls -> defaults (with reconfigure)")
@@ -317,6 +334,7 @@ class CameraManager:
             "awbmode": AWB_BY_VALUE.get(c.get("AwbMode", 0), "auto"),
             "hflip": self.hflip,
             "vflip": self.vflip,
+            "quality": self.jpeg_q,
         }
 
     def state(self):
@@ -407,6 +425,7 @@ PAGE_TMPL = """<!DOCTYPE html>
   <label>Contrast <input type="range" id="contrast" min="0" max="4" step="0.1"></label>
   <label>Saturation <input type="range" id="saturation" min="0" max="4" step="0.1"></label>
   <label>Sharpness <input type="range" id="sharpness" min="0" max="4" step="0.1"></label>
+  <label>JPEG quality <input type="range" id="quality" min="25" max="95" step="5"></label>
   <label><input type="checkbox" id="hflip"> Flip H</label>
   <label><input type="checkbox" id="vflip"> Flip V</label>
   <label><input type="checkbox" id="ae"> Auto exposure</label>
@@ -437,18 +456,18 @@ sel.addEventListener('change',async()=>{
 const am=document.getElementById('awbmode');
 for(const m of awbmodes){const e=document.createElement('option');e.value=m;e.textContent=m;am.appendChild(e);}
 function setVal(id,v){const el=document.getElementById(id);if(el.type==='checkbox')el.checked=!!v;else el.value=v;}
-for(const k of ['brightness','contrast','saturation','sharpness','exposure','gain','ae','awb','hflip','vflip'])setVal(k,ctl[k]);
+for(const k of ['brightness','contrast','saturation','sharpness','quality','exposure','gain','ae','awb','hflip','vflip'])setVal(k,ctl[k]);
 am.value=ctl.awbmode;
 async function send(field,value){
   msg.textContent='applying '+field+'...';
   try{
     const r=await fetch('/set_controls?'+field+'='+encodeURIComponent(value),{method:'POST'});
     const j=await r.json();
-    if(j.ok){msg.textContent=field+' set';if(field==='hflip'||field==='vflip')img.src='/stream.mjpg?_='+Date.now();}
+    if(j.ok){msg.textContent=field+' set';if(field==='hflip'||field==='vflip'||field==='quality')img.src='/stream.mjpg?_='+Date.now();}
     else{msg.textContent='error: '+(j.error||'failed');}
   }catch(e){msg.textContent='error: '+e;}
 }
-for(const id of ['brightness','contrast','saturation','sharpness'])
+for(const id of ['brightness','contrast','saturation','sharpness','quality'])
   document.getElementById(id).addEventListener('change',e=>send(id,e.target.value));
 for(const id of ['exposure','gain'])
   document.getElementById(id).addEventListener('change',e=>send(id,e.target.value));
@@ -462,7 +481,7 @@ document.getElementById('reset').addEventListener('click',async()=>{
     const j=await r.json();
     if(j.ok){
       const c=j.controls;
-      for(const k of ['brightness','contrast','saturation','sharpness','exposure','gain','ae','awb','hflip','vflip'])setVal(k,c[k]);
+      for(const k of ['brightness','contrast','saturation','sharpness','quality','exposure','gain','ae','awb','hflip','vflip'])setVal(k,c[k]);
       am.value=c.awbmode;
       msg.textContent='defaults restored';img.src='/stream.mjpg?_='+Date.now();
     }else{msg.textContent='error: '+(j.error||'failed');}
@@ -582,12 +601,19 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     hflip = vflip = False
             except ValueError:
                 pass
-        if not controls and hflip is None and vflip is None:
+        jpeg_q = None
+        if "quality" in flat or "jpeg_q" in flat:
+            try:
+                jpeg_q = int(flat.get("quality", flat.get("jpeg_q")))
+            except (ValueError, TypeError):
+                pass
+        if not controls and hflip is None and vflip is None and jpeg_q is None:
             self._json({"ok": False, "error": "no recognized controls in request",
                         **manager.state()}, 400)
             return
         try:
-            manager.update_controls(hflip=hflip, vflip=vflip, controls=controls)
+            manager.update_controls(hflip=hflip, vflip=vflip,
+                                    controls=controls, jpeg_q=jpeg_q)
         except ValueError as e:
             self._json({"ok": False, "error": str(e), **manager.state()}, 400)
             return

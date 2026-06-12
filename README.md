@@ -91,7 +91,8 @@ curl -k -u admin:secret -X POST "https://pi.local/set_resolution?res=1280x720&fp
 curl -k -u admin:secret -X POST "https://pi.local/set_controls?contrast=1.4&hflip=1"
 ```
 
-**Controls** (`/set_controls`, all optional): `brightness` (−1…1), `contrast`/`saturation`
+**Controls** (`/set_controls`, all optional): `quality` (JPEG 25…95 — raise it to cut
+compression artifacts), `brightness` (−1…1), `contrast`/`saturation`
 (0…32), `sharpness` (0…16), `hflip`/`vflip`/`rotate=180`, `ae` (auto-exposure on/off),
 `exposure` (µs) and `gain` when `ae=0`, `awb` (auto white-balance on/off), and `awbmode`
 (`auto, incandescent, tungsten, fluorescent, indoor, daylight, cloudy`). Values are clamped;
@@ -113,6 +114,7 @@ Constants at the top of [`mjpeg_server.py`](mjpeg_server.py):
 - `ALLOWED` — the whitelist of selectable `(width, height)` resolutions
 - `DEFAULT_SIZE`, `DEFAULT_FPS` — startup defaults
 - `MIN_FPS` / `MAX_FPS` — clamp for the optional `fps` parameter
+- `DEFAULT_JPEG_Q`, `MIN_JPEG_Q` / `MAX_JPEG_Q` — MJPEG encoder quality + clamp
 - `LIVE_CONTROLS`, `EXPOSURE_RANGE`, `GAIN_RANGE`, `AWB_MODES` — control names + clamp ranges
 
 After editing, apply with `sudo systemctl restart picam-stream`.
