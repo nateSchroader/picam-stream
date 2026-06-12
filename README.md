@@ -7,11 +7,18 @@ supports **live, persistent resolution switching** from the browser or a simple 
 
 ## Features
 
-- 📷 **Zero-install viewing** — open a URL in any browser on your LAN; no client app.
+- 📷 **Zero-install viewing** — open a URL in any browser; no client app.
 - 🎚️ **Dynamic resolution** — switch resolution live from a dropdown or via `curl`, with no
   restart. The choice **persists across reboots**.
-- 🛡️ **Whitelisted resolutions** — a typo can't OOM a 512 MB board.
-- ⚙️ **systemd service** — starts on boot, restarts on failure.
+- 🎛️ **Camera controls** — flip/mirror, brightness, contrast, saturation, sharpness, and
+  exposure/white-balance, live from the UI or API; persisted too.
+- 📸 **Snapshots** — `/snapshot.jpg` returns the current frame (near-zero cost).
+- ❤️ **Health endpoint** — `/healthz` reports CPU temp, real FPS, uptime, and client count.
+- 🔒 **Secure by default** — binds to localhost and sits behind a TLS + Basic-Auth Caddy
+  proxy (one flag: `./install.sh --with-proxy`).
+- 🛡️ **Whitelisted resolutions** + a concurrent-stream cap — a typo (or a flood of clients)
+  can't OOM a 512 MB board.
+- ⚙️ **systemd service** — starts on boot, restarts on failure, sandboxed.
 - 🪶 **Lightweight** — software-encoded JPEG, modest defaults tuned for the Zero 2 W.
 
 ## Requirements
@@ -26,13 +33,19 @@ supports **live, persistent resolution switching** from the browser or a simple 
 ```bash
 git clone <your-repo-url> picam-stream
 cd picam-stream
-./install.sh
+./install.sh --with-proxy     # TLS + Basic Auth via Caddy (recommended)
 ```
 
-Then open **`http://<your-pi>.local:8000/`** from any device on your network.
+Then open **`https://<your-pi>.local/`** and log in with the username/password you chose.
 
 `install.sh` is idempotent: it installs the dependencies, installs and enables the systemd
-service for the current user, and checks that a camera is detected.
+service for the current user, and checks that a camera is detected. With `--with-proxy` it
+also installs Caddy and writes `/etc/caddy/Caddyfile` (prompting for a password, or reading
+`PICAM_PROXY_USER`/`PICAM_PROXY_PASS` from the environment).
+
+> **Plain `./install.sh` (no proxy)** binds the app to **localhost only**, so it isn't
+> reachable from other devices until you add a proxy or opt into direct LAN access — see
+> [Security](#security).
 
 ## Camera not detected? (read this for Camera Module 2)
 
@@ -55,28 +68,60 @@ The full debugging story is in [CLAUDE.md](CLAUDE.md).
 
 ## Usage
 
-| What | How |
-|---|---|
-| **Web UI** | `http://<pi>:8000/` — live view + resolution dropdown |
-| **Raw MJPEG** | `http://<pi>:8000/stream.mjpg` — embed in `<img>`, VLC, Home Assistant, … |
-| **Current settings** | `curl http://<pi>:8000/config` → JSON |
-| **Change resolution** | `curl -X POST "http://<pi>:8000/set_resolution?res=1280x720"` (optional `&fps=15`) |
+URLs below assume the Caddy proxy (`https://<pi>/…`). Behind it, the app's routes are
+unchanged; if you run without the proxy they're at `http://<pi>:8000/…` (localhost-only by
+default). For `curl` through the proxy, add `-u user:pass` and `-k` (Caddy's internal CA).
+
+| What | Route | Notes |
+|---|---|---|
+| **Web UI** | `/` | live view, resolution dropdown, **camera-controls panel**, snapshot link |
+| **Raw MJPEG** | `/stream.mjpg` | embed in `<img>`, VLC, Home Assistant, … |
+| **Snapshot** | `/snapshot.jpg` | single still (the current frame) |
+| **Current settings** | `/config` | JSON: resolution, fps, control values |
+| **Health/metrics** | `/healthz` | JSON: CPU temp, real fps, uptime, client count, free RAM |
+| **Change resolution** | `POST /set_resolution?res=1280x720` | optional `&fps=15` |
+| **Change controls** | `POST /set_controls?brightness=0.1&hflip=1&awb=auto` | see below |
+
+`set_resolution` and `set_controls` are **POST-only** (a `GET` returns 405).
+
+```bash
+# examples (through the proxy)
+curl -k -u admin:secret "https://pi.local/snapshot.jpg" -o frame.jpg
+curl -k -u admin:secret -X POST "https://pi.local/set_resolution?res=1280x720&fps=15"
+curl -k -u admin:secret -X POST "https://pi.local/set_controls?contrast=1.4&hflip=1"
+```
+
+**Controls** (`/set_controls`, all optional): `brightness` (−1…1), `contrast`/`saturation`
+(0…32), `sharpness` (0…16), `hflip`/`vflip`/`rotate=180`, `ae` (auto-exposure on/off),
+`exposure` (µs) and `gain` when `ae=0`, `awb` (auto white-balance on/off), and `awbmode`
+(`auto, incandescent, tungsten, fluorescent, indoor, daylight, cloudy`). Values are clamped;
+the choices persist across restarts. Pass **`reset=1`** (or click **Reset to defaults** in the
+controls panel) to revert every control and flip to its default.
 
 Default resolution menu: `640x480, 800x600, 1024x768, 1280x720, 1640x1232, 1920x1080`.
 
 ## Configuration
 
-Edit the constants at the top of [`mjpeg_server.py`](mjpeg_server.py):
+Environment variables (set in the systemd unit, `Environment=…`):
 
-- `PORT` — HTTP port (default `8000`)
+- `PICAM_BIND` — bind address (default `127.0.0.1`; set `0.0.0.0` for direct LAN access)
+- `PICAM_PORT` — HTTP port (default `8000`)
+- `PICAM_MAX_STREAMS` — max concurrent MJPEG clients before `503` (default `4`)
+
+Constants at the top of [`mjpeg_server.py`](mjpeg_server.py):
+
 - `ALLOWED` — the whitelist of selectable `(width, height)` resolutions
 - `DEFAULT_SIZE`, `DEFAULT_FPS` — startup defaults
 - `MIN_FPS` / `MAX_FPS` — clamp for the optional `fps` parameter
+- `LIVE_CONTROLS`, `EXPOSURE_RANGE`, `GAIN_RANGE`, `AWB_MODES` — control names + clamp ranges
 
 After editing, apply with `sudo systemctl restart picam-stream`.
 
-The currently selected resolution is stored in `stream-config.json` (gitignored — it's
-per-machine runtime state) and reloaded on startup, which is how the choice survives reboots.
+Selected resolution **and controls** are stored in `stream-config.json` and reloaded on
+startup (how the choices survive reboots). Under systemd this lives in
+**`/var/lib/picam-stream/`** (`StateDirectory`); for a manual `python3 mjpeg_server.py` run it
+falls back to the script's own directory. It's gitignored, per-machine runtime state —
+deleting it just resets to defaults.
 
 ## Managing the service
 
@@ -96,10 +141,25 @@ Start modest and increase to taste.
 
 ## Security
 
-⚠️ The stream is **unauthenticated** and bound to **all interfaces** on port 8000 — anyone on
-your LAN can view it. That's fine for a trusted home network, but **do not port-forward it to
-the internet as-is**. For remote access, put it behind a VPN (Tailscale / WireGuard) or an
-authenticated reverse proxy.
+The intended topology is **browser → Caddy (TLS + Basic Auth) → `127.0.0.1:8000` (app)**:
+
+- The Python app **binds to localhost** (`PICAM_BIND=127.0.0.1`), so it is not directly
+  reachable from the network — **Caddy is the only public listener**. It terminates HTTPS
+  and enforces HTTP Basic Auth (see [`Caddyfile.example`](Caddyfile.example)).
+- The **systemd unit is sandboxed** (`NoNewPrivileges`, `ProtectSystem=strict`, dropped
+  capabilities, syscall filtering, …). Device access is left open on purpose — the camera
+  needs it.
+- A **concurrent-stream cap** (`PICAM_MAX_STREAMS`, default 4) returns `503` beyond the limit,
+  so a client flood can't exhaust the 512 MB board. State-changing routes are **POST-only**.
+
+`tls internal` uses Caddy's **local CA** (great for a LAN; trust its root on your devices to
+silence browser warnings). With a publicly-resolvable domain, drop that line for automatic
+Let's Encrypt certificates. Prefer **nginx**? Proxy the same way, but you must add
+`proxy_buffering off;` on the stream location or the MJPEG feed will stall.
+
+> **Direct LAN access without a proxy** (unauthenticated, plaintext): set `PICAM_BIND=0.0.0.0`
+> in the unit and restart. Only do this on a trusted network, and **never port-forward it to
+> the internet as-is** — use the proxy, a VPN (Tailscale / WireGuard), or both.
 
 ## Other cameras
 
@@ -111,9 +171,12 @@ Any libcamera-supported sensor should work once it's detected
 ```
 picam-stream/
 ├── mjpeg_server.py       # the streaming server (Picamera2 + stdlib HTTP)
-├── picam-stream.service  # systemd unit template (install.sh fills in user/path)
-├── install.sh            # idempotent installer
+├── picam-stream.service  # sandboxed systemd unit template (install.sh fills in user/path)
+├── Caddyfile.example     # reverse-proxy template (TLS + Basic Auth) for manual setup
+├── install.sh            # idempotent installer ( --with-proxy installs/configures Caddy )
 ├── README.md             # this file
-├── CLAUDE.md             # context/onboarding for AI agents (the "why" + history)
-└── stream-config.json    # runtime state (gitignored): current resolution
+└── CLAUDE.md             # context/onboarding for AI agents (the "why" + history)
 ```
+
+Runtime state lives outside the repo at `/var/lib/picam-stream/stream-config.json` (current
+resolution + controls); deleting it resets to defaults.

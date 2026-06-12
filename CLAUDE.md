@@ -8,7 +8,10 @@ from the code alone.
 
 A single-file Python MJPEG camera-streaming server (`mjpeg_server.py`) for a Raspberry Pi
 Camera Module 2 (IMX219), run as a systemd service named `picam-stream`. It serves a browser
-UI plus a raw MJPEG stream and supports **live, persistent resolution switching** over HTTP.
+UI plus a raw MJPEG stream and supports **live, persistent resolution switching and camera
+controls** (flip, brightness/contrast/etc., exposure, white balance) over HTTP, plus a
+`/snapshot.jpg` still and a `/healthz` metrics endpoint. By default it **binds to localhost**
+and is meant to sit behind a **Caddy reverse proxy** that terminates TLS + Basic Auth.
 
 **Reference deployment:** a headless Raspberry Pi **Zero 2 W** (512 MB RAM, quad Cortex-A53)
 running Raspberry Pi OS **Trixie**, accessed over SSH. The project lives in `~/picam-stream`
@@ -38,43 +41,81 @@ and the service runs as the login user (who must be in the `video` group).
    the **live** camera (stop → reconfigure → start) via `/set_resolution`, offers a dropdown
    UI, **whitelists** sizes (`ALLOWED`) for safety on the small board, and **persists** the
    choice to `stream-config.json` (reloaded on startup → survives reboots).
+7. **Security-first expansion** (the current architecture): the app now **binds localhost**
+   (`PICAM_BIND`, default `127.0.0.1`) and sits behind a **Caddy** reverse proxy doing TLS +
+   Basic Auth (`Caddyfile.example`, `install.sh --with-proxy`). The systemd unit gained
+   **sandboxing** (see gotcha below), a **concurrent-stream cap** (`PICAM_MAX_STREAMS` → 503),
+   and **POST-only** mutation. Then features: `/snapshot.jpg` (returns the already-buffered
+   frame — near-zero cost), **camera controls** (`/set_controls`, persisted alongside
+   resolution), and `/healthz`. Config moved to `StateDirectory` (`/var/lib/picam-stream/`).
 
 ## Code map (`mjpeg_server.py`)
 
 - `StreamingOutput` — thread-safe holder of the latest JPEG frame. `close()` is a deliberate
   **no-op** so the object survives the camera being stopped/restarted during a resolution
-  change (otherwise the encoder's `FileOutput` could close it and break later writes).
-- `CameraManager` — owns the `Picamera2` instance. `set_resolution()` serializes
-  reconfiguration with a lock and saves state; `_load()/_save()` use `stream-config.json`.
-- `StreamingHandler` — HTTP routes: `/` & `/index.html` (UI), `/stream.mjpg` (multipart
-  MJPEG), `/config` (JSON state), `/set_resolution` (GET or POST, `res=WxH[&fps=N]`).
-- Tunables at the top: `PORT`, `ALLOWED`, `DEFAULT_SIZE`, `DEFAULT_FPS`, `MIN/MAX_FPS`.
+  change (otherwise the encoder's `FileOutput` could close it and break later writes). Also
+  tracks recent frame timestamps → `fps()` for `/healthz`.
+- `CameraManager` — owns the `Picamera2` instance. `set_resolution()` and `update_controls()`
+  serialize (re)configuration with a lock and save state. **Flip changes go through the
+  stop→reconfigure→start path** (`Transform` is set at configure time); other controls apply
+  **live** via `set_controls()`. `_start()` reapplies persisted controls after every
+  (re)start. `_load()/_save()` use `stream-config.json`; `validate_controls()` clamps/whitelists.
+- `StreamingHandler` — routes: `/` & `/index.html` (UI), `/stream.mjpg` (multipart MJPEG,
+  guarded by a `BoundedSemaphore` cap → 503), `/snapshot.jpg` (latest buffered frame),
+  `/config` & `/healthz` (JSON), and **POST-only** `/set_resolution` (`res=WxH[&fps=N]`) and
+  `/set_controls` (`brightness=…&hflip=1&awb=auto&awbmode=…`). GET on the setters → 405.
+- Tunables/env at the top: `PORT`/`PICAM_PORT`, `BIND`/`PICAM_BIND`, `MAX_STREAMS`/
+  `PICAM_MAX_STREAMS`, `ALLOWED`, `DEFAULT_SIZE`, `DEFAULT_FPS`, `MIN/MAX_FPS`, `LIVE_CONTROLS`,
+  `EXPOSURE_RANGE`, `GAIN_RANGE`, `AWB_MODES`, `STATE_DIR`/`CONFIG_PATH`.
 
 ## Operational facts & gotchas
 
 - **Service:** `picam-stream.service` (enabled on boot). Runs as the login user, who **must be
   in the `video` group** for camera access. Manage via `systemctl` / `journalctl -u picam-stream`.
 - **Editing the server** requires `sudo systemctl restart picam-stream` to take effect.
-- **`stream-config.json`** is runtime state (gitignored). Don't commit it; deleting it just
-  resets to `DEFAULT_SIZE`.
+- **Localhost bind by default** (`Environment=PICAM_BIND=127.0.0.1` in the unit): the app is
+  **not** reachable from the LAN directly — Caddy is. To test on the Pi, curl `127.0.0.1:8000`.
+  For direct LAN access set `PICAM_BIND=0.0.0.0` and restart (unauthenticated — trusted nets).
+- **⚠️ systemd sandboxing vs. the camera:** the unit is hardened (`ProtectSystem=strict`,
+  `NoNewPrivileges`, syscall filter, dropped caps…). The camera needs a broad device surface
+  (`/dev/video*`, `/dev/media*`, `/dev/dma_heap*`), so **do NOT add `PrivateDevices` or
+  `DevicePolicy=closed`** — that breaks capture. If the service fails to start after a
+  hardening change, `journalctl -u picam-stream -e` and relax the offending directive (usually
+  `ProtectSystem` or `SystemCallFilter`). `MemoryDenyWriteExecute` is intentionally **off**.
+- **Caddy proxy:** config at `/etc/caddy/Caddyfile` (generated by `install.sh --with-proxy`;
+  template `Caddyfile.example`). **Gotcha:** the `reverse_proxy` block needs `flush_interval -1`
+  or the MJPEG stream stalls (proxy buffers the endless multipart response). Manage with
+  `systemctl … caddy` / `journalctl -u caddy`. `tls internal` ⇒ Caddy's local CA.
+- **`stream-config.json`** is runtime state (gitignored), now under **`/var/lib/picam-stream/`**
+  (`StateDirectory`) when run by systemd. Holds resolution **+ controls**; deleting it resets
+  to defaults.
 - **Camera enablement** lives in `/boot/firmware/config.txt` (`dtoverlay=imx219`). Changing the
   camera or its cabling needs a **power-cycle/reboot** — CSI is not hot-pluggable.
 - **Reboots drop the agent's session** if it's running on the Pi over SSH. Expect to reconnect
   and resume after any reboot.
 - **Constraints:** 512 MB RAM; **software** JPEG encoding (CPU-bound). Keep defaults modest —
-  high resolutions lower the effective frame rate, not the sensor's.
+  high resolutions lower the effective frame rate, not the sensor's. The stream cap
+  (`PICAM_MAX_STREAMS`, default 4) bounds concurrent clients.
 - **`vcgencmd get_camera` is unreliable** on the libcamera stack (often shows `detected=0` even
-  when the camera works). Trust **`rpicam-hello --list-cameras`** instead.
+  when the camera works). Trust **`rpicam-hello --list-cameras`** instead. (`vcgencmd
+  get_throttled` *is* reliable — handy for spotting undervoltage.)
 
 ## Quick recipes
 
 - Camera healthy?  `rpicam-hello --list-cameras`  (expect an `imx219` entry)
-- Feed up?  `systemctl is-active picam-stream` and
-  `curl -fsS -o /dev/null -w '%{http_code}\n' http://localhost:8000/index.html`
-- Change resolution:  `curl -X POST "http://localhost:8000/set_resolution?res=1280x720"`
-- Fresh install on another Pi:  `./install.sh`
+- Feed up? (on the Pi — app is localhost-bound)  `systemctl is-active picam-stream` and
+  `curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/index.html`
+- Health:  `curl -s http://127.0.0.1:8000/healthz`  (temp, fps, uptime, clients, free RAM)
+- Change resolution:  `curl -X POST "http://127.0.0.1:8000/set_resolution?res=1280x720"`
+- Flip / control:  `curl -X POST "http://127.0.0.1:8000/set_controls?hflip=1&contrast=1.4"`
+- Through the proxy:  `curl -k -u USER:PASS https://$(hostname).local/healthz`
+- Check hardening:  `systemd-analyze security picam-stream`
+- Fresh install on another Pi:  `./install.sh --with-proxy`
 
 ## Security
 
-Unauthenticated, all-interfaces, port 8000 — LAN-only by design. Never expose it directly to
-the internet; use a VPN or an authenticated reverse proxy.
+Topology: **browser → Caddy (TLS + Basic Auth) → `127.0.0.1:8000` (app)**. The app binds
+localhost, so Caddy is the only public listener; the systemd unit is sandboxed; a
+concurrent-stream cap and POST-only setters limit abuse. `PICAM_BIND=0.0.0.0` re-exposes it
+unauthenticated for a trusted LAN. Never port-forward it to the internet without the proxy
+(and/or a VPN). See README → Security and `Caddyfile.example`.

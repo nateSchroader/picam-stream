@@ -1,0 +1,36 @@
+# picam-stream reverse proxy (Caddy v2)
+# ---------------------------------------------------------------------------
+# Terminates TLS and enforces HTTP Basic Auth in front of the localhost-bound
+# MJPEG server. The Python app listens only on 127.0.0.1:8000, so Caddy is the
+# only public listener.
+#
+# Easiest path:  ./install.sh --with-proxy   (installs Caddy, prompts for a
+# password, and writes /etc/caddy/Caddyfile for you).
+#
+# Manual path:
+#   1. Install Caddy (https://caddyserver.com/docs/install).
+#   2. Generate a password hash:   caddy hash-password --plaintext 'your-password'
+#   3. Copy this file to /etc/caddy/Caddyfile, replacing `picam.local` with your
+#      Pi's hostname and `__HASH__` with the hash from step 2.
+#   4. sudo systemctl reload caddy
+#
+# `tls internal` uses Caddy's own local CA -- ideal for a LAN. Your browser will
+# warn until you trust Caddy's root CA on each viewing device (the root is at
+# /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt). For a real
+# domain that resolves publicly, delete the `tls internal` line and Caddy will
+# fetch a trusted Let's Encrypt certificate automatically.
+
+picam.local {
+    tls internal
+
+    basic_auth {
+        # username    bcrypt-hash   (from: caddy hash-password)
+        admin __HASH__
+    }
+
+    reverse_proxy 127.0.0.1:8000 {
+        # CRITICAL for MJPEG: flush every frame immediately rather than buffering
+        # the never-ending multipart response (otherwise the live stream stalls).
+        flush_interval -1
+    }
+}
