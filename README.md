@@ -117,7 +117,3 @@ picam-stream/
 ├── CLAUDE.md             # context/onboarding for AI agents (the "why" + history)
 └── stream-config.json    # runtime state (gitignored): current resolution
 ```
-
-## License
-
-No license yet — add one (e.g. MIT) before publishing if you want others to reuse it.
