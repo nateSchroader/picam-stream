@@ -1,0 +1,12 @@
+# Runtime state — per-machine, written by the server at runtime
+stream-config.json
+stream-config.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

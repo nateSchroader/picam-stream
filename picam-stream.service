@@ -1,0 +1,19 @@
+# systemd unit TEMPLATE for picam-stream.
+# install.sh substitutes __USER__ and __APPDIR__ and writes the result to
+# /etc/systemd/system/picam-stream.service. To install by hand instead, copy this
+# file there and replace the two placeholders with your username and the absolute
+# path to this project directory.
+[Unit]
+Description=Picamera2 MJPEG camera stream (Camera Module 2)
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+ExecStart=/usr/bin/python3 __APPDIR__/mjpeg_server.py
+Restart=on-failure
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
