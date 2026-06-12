@@ -135,11 +135,38 @@ sudo systemctl stop picam-stream     # stop the feed
 sudo systemctl disable picam-stream  # don't start on boot
 ```
 
+With the Caddy proxy, manage it the same way (`systemctl … caddy`, `journalctl -u caddy -f`).
+Its config is `/etc/caddy/Caddyfile`; reload after edits with `sudo systemctl reload caddy`.
+
 ## Performance notes
 
 JPEG is encoded in **software** on the Pi Zero 2 W, so CPU — not the sensor — is the
-bottleneck. 640×480 is smooth; higher resolutions deliver a lower effective frame rate.
-Start modest and increase to taste.
+bottleneck. **Both** resolution and JPEG quality (`quality`, default 85) drive CPU: 640×480 is
+smooth at any quality, while e.g. 1080p @ q85 runs ~17–18 fps. Start modest and increase to
+taste; drop resolution or quality to recover frame rate.
+
+See [Improving image quality](#improving-image-quality) for the non-resolution levers
+(white balance, focus, lighting, noise).
+
+## Improving image quality
+
+Resolution and JPEG `quality` are only part of the picture. If the feed looks soft, noisy, or
+oddly tinted, the cause is usually one of these:
+
+- **Colour cast (e.g. pink/magenta)** — white balance. Set **WB mode** in the controls panel
+  to match your light (`indoor`, `fluorescent`, `incandescent`, …), or turn off auto WB and
+  tune manually. If a cast persists across *every* mode, check you don't have a **NoIR** sensor
+  — it loads the standard `imx219.json` tuning and tints everything.
+- **Soft / out of focus** — the Camera Module 2 (IMX219) is **fixed-focus** (~1 m→∞). Close
+  subjects sit inside its blur zone; move the subject back, manually rotate the lens to
+  refocus, or use a **Camera Module 3** (autofocus).
+- **Noise / speckle** — low light. More light is the single biggest quality multiplier (less
+  gain → less noise, shorter exposure → less motion blur). In good light you can also lower
+  `gain` (with `ae=0`), or nudge `sharpness`/`contrast` to taste.
+- **Blocky / mushy patches** — JPEG compression; raise `quality` (costs CPU + bandwidth).
+
+Everything except focus and lighting is adjustable live from the controls panel or
+`/set_controls`, and persists across restarts.
 
 ## Security
 
