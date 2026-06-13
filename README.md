@@ -31,12 +31,12 @@ supports **live, persistent resolution switching** from the browser or a simple 
 ## Quick start
 
 ```bash
-git clone <your-repo-url> picam-stream
+git clone <repo-url> picam-stream
 cd picam-stream
 ./install.sh --with-proxy     # TLS + Basic Auth via Caddy (recommended)
 ```
 
-Then open **`https://<your-pi>.local/`** and log in with the username/password you chose.
+Then open **`https://<your-pi-hostname>.local/`** and log in with the username/password you chose.
 
 `install.sh` is idempotent: it installs the dependencies, installs and enables the systemd
 service for the current user, and checks that a camera is detected. With `--with-proxy` it
